@@ -1,5 +1,5 @@
 [package]
-authors = ["Dario Nieuwenhuis <dirbaio@dirbaio.net>"]
+authors = ["John Whittington <git@jbrengineering.co.uk>"]
 edition = "2021"
 name = "tailwind"
 version = "0.1.0"
@@ -30,22 +30,3 @@ embassy-executor = { git = "https://github.com/embassy-rs/embassy", rev = "ce662
 embassy-macros = { git = "https://github.com/embassy-rs/embassy", rev = "ce662766be80d75b5f9294ae4b792f7db252ccd3" }
 embassy-sync = { git = "https://github.com/embassy-rs/embassy", rev = "ce662766be80d75b5f9294ae4b792f7db252ccd3" }
 embassy-time = { git = "https://github.com/embassy-rs/embassy", rev = "ce662766be80d75b5f9294ae4b792f7db252ccd3" }
-
-[profile.release]
-codegen-units = 1
-debug = 2
-debug-assertions = false
-incremental = false
-lto = "fat"
-opt-level = 's'
-overflow-checks = false
-
-[profile.release.build-override]
-codegen-units = 8
-debug = false
-debug-assertions = false
-opt-level = 0
-overflow-checks = false
-
-[[bin]]
-name = "tailwind"
