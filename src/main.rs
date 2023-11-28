@@ -14,11 +14,12 @@ use core::mem;
 use defmt::{info, debug, *};
 use embassy_executor::Spawner;
 use embassy_nrf::gpio::{Input, Pin as _, AnyPin, Pull};
+use embassy_nrf::interrupt::Priority;
 use nrf_softdevice::ble::{central, gatt_client, Address, AddressType, Connection};
 use nrf_softdevice::{raw, Softdevice};
 use core::cell::RefCell;
 use embassy_sync::blocking_mutex::Mutex;
-use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
+use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use futures::pin_mut;
 
 const HEADWIND_ADDR: [u8; 6] = [0xb9, 0xb1, 0x4f, 0x9d, 0x10, 0xe3];
@@ -143,7 +144,7 @@ impl From<HeadwindState> for [u8; 4] {
 struct Headwind {
     conn: Connection,
     client: HeadwindServiceClient,
-    state: Mutex<ThreadModeRawMutex, RefCell<HeadwindState>>,
+    state: Mutex<NoopRawMutex, RefCell<HeadwindState>>,
 }
 
 impl Headwind {
@@ -152,12 +153,14 @@ impl Headwind {
             self.state.lock(|state| {
                 *state.borrow_mut() = new_state;
             });
+            // *self.state.lock().await.borrow_mut() = new_state;
         }
     }
 
     async fn read_state(&self) -> Result<HeadwindState, gatt_client::ReadError> {
         let val = unwrap!(self.client.command_read().await);
         self.update_state(&val);
+        // Ok(*self.state.lock().await.borrow())
         Ok(self.state.lock(|state| *state.borrow()))
     }
 
@@ -167,11 +170,13 @@ impl Headwind {
     // }
 
     async fn cycle_state_up(&self) -> Result<(), gatt_client::WriteError> {
+        // let buf: [u8; 4] = self.state.lock().await.borrow().next().to_bytes();
         let buf: [u8; 4] = self.state.lock(|state| state.borrow().next().to_bytes());
         self.client.command_write(&buf).await
     }
 
     async fn cycle_state_down(&self) -> Result<(), gatt_client::WriteError> {
+        // let buf: [u8; 4] = self.state.lock().await.borrow().previous().to_bytes();
         let buf: [u8; 4] = self.state.lock(|state| state.borrow().previous().to_bytes());
         self.client.command_write(&buf).await
     }
@@ -206,8 +211,6 @@ async fn try_connect_headwind(sd: &'static Softdevice, addr: &[u8; 6]) -> Result
             Err(e)
         }
     }
-
-    // gatt_client::discover(&conn).await.map(|client| Headwind { conn, client, state: Mutex::new(RefCell::new(HeadwindState::Off)) })
 }
 
 async fn find_headwind(sd: &'static Softdevice) -> Headwind {
@@ -223,8 +226,9 @@ async fn find_headwind(sd: &'static Softdevice) -> Headwind {
             return None;
         }
 
+        // TODO find no based on address
         if params.peer_addr.addr == HEADWIND_ADDR {
-            info!("Found headwind!");
+            info!("Found headwind! {:x}", params.peer_addr.addr);
             Some(params.peer_addr.addr)
         } else {
             info!("Not headwind: {:x}", params.peer_addr.addr);
@@ -236,7 +240,9 @@ async fn find_headwind(sd: &'static Softdevice) -> Headwind {
 }
 
 fn init_buttons() -> (Input<'static, AnyPin>, Input<'static, AnyPin>) {
-    let config = embassy_nrf::config::Config::default();
+    let mut config = embassy_nrf::config::Config::default();
+    config.gpiote_interrupt_priority = Priority::P2;
+    config.time_interrupt_priority = Priority::P2;
     let p = embassy_nrf::init(config);
 
     let button1 = Input::new(p.P0_11.degrade(), Pull::Up);
@@ -254,11 +260,11 @@ async fn button_task<'a>(up_btn: &'a mut Input<'_, AnyPin>, down_btn: &'a mut In
         match futures::future::select(btn1_fut, btn2_fut).await {
             futures::future::Either::Left(_) => {
                 info!("Button 1 pressed");
-                unwrap!(headwind.cycle_state_up().await);
+                unwrap!(headwind.cycle_state_down().await);
             }
             futures::future::Either::Right(_) => {
                 info!("Button 2 pressed");
-                unwrap!(headwind.cycle_state_down().await);
+                unwrap!(headwind.cycle_state_up().await);
             }
         }
     }
@@ -267,6 +273,9 @@ async fn button_task<'a>(up_btn: &'a mut Input<'_, AnyPin>, down_btn: &'a mut In
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     info!("Tailwind Remote");
+
+    let (mut up_btn, mut down_btn) = init_buttons();
+    // pin_mut!(up_btn, down_btn);
 
     let config = nrf_softdevice::Config {
         clock: Some(raw::nrf_clock_lf_cfg_t {
@@ -301,10 +310,9 @@ async fn main(spawner: Spawner) {
     let sd = Softdevice::enable(&config);
     unwrap!(spawner.spawn(softdevice_task(sd)));
 
-    let (mut up_btn, mut down_btn) = init_buttons();
-
     loop {
         let headwind = find_headwind(sd).await;
+        // let headwind = unwrap!(try_connect_headwind(sd, &HEADWIND_ADDR).await);
 
         // Enable command notifications from the peripheral
         headwind.client.command_cccd_write(true).await.unwrap();
@@ -315,10 +323,8 @@ async fn main(spawner: Spawner) {
         // Receive notifications
         let gatt_fut = gatt_client::run(&headwind.conn, &headwind.client, |event| match event {
             HeadwindServiceClientEvent::CommandNotification(val) => {
-                trace!("notification: {}", val);
-                headwind.state.lock(|state| {
-                    *state.borrow_mut() = HeadwindState::try_from(&val).unwrap_or(HeadwindState::Off);
-                });
+                info!("notification: {}", val);
+                headwind.update_state(&val);
             }
         });
 
@@ -329,7 +335,7 @@ async fn main(spawner: Spawner) {
         // - if the gatt future exits the connection was lost
         let _ = match futures::future::select(button_fut, gatt_fut).await {
             futures::future::Either::Left((_, _)) => {
-                info!("ADC encountered an error and stopped!")
+                info!("Buttons encountered an error and stopped!")
             }
             futures::future::Either::Right((e, _)) => {
                 info!("gatt_server run exited with error: {:?}", e);
