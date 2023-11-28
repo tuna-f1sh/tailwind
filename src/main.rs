@@ -1,30 +1,267 @@
 #![no_std]
 #![no_main]
 #![feature(type_alias_impl_trait)]
+
 #![macro_use]
 
 use defmt_rtt as _; // global logger
-use embassy_nrf as _; // time driver
+use embassy_nrf as _;
+// time driver
 use panic_probe as _;
 
 use core::mem;
 
-use defmt::{info, *};
+use defmt::{info, debug, *};
 use embassy_executor::Spawner;
-use nrf_softdevice::ble::{central, gatt_client, Address, AddressType};
+use embassy_nrf::gpio::{Input, Pin as _, AnyPin, Pull};
+use nrf_softdevice::ble::{central, gatt_client, Address, AddressType, Connection};
 use nrf_softdevice::{raw, Softdevice};
+use core::cell::RefCell;
+use embassy_sync::blocking_mutex::Mutex;
+use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
+use futures::pin_mut;
 
 const HEADWIND_ADDR: [u8; 6] = [0xb9, 0xb1, 0x4f, 0x9d, 0x10, 0xe3];
+
+#[nrf_softdevice::gatt_client(uuid = "a026ee0c-0a7d-4ab3-97fa-f1500f9feb8b")]
+struct HeadwindServiceClient {
+    #[characteristic(uuid = "a026e038-0a7d-4ab3-97fa-f1500f9feb8b", read, write, notify)]
+    command: [u8; 4],
+}
+
+#[derive(Clone, Copy, Debug, defmt::Format)]
+#[repr(u8)]
+enum HeadwindState {
+    Off = 0x01,
+    HeartRate = 0x02,
+    Speed = 0x03,
+    Manual(u8) = 0x04,
+    Sleep = 0x05,
+}
+
+impl HeadwindState {
+    fn to_bytes(self) -> [u8; 4] {
+        self.into()
+    }
+
+    fn next(self) -> Self {
+        match self {
+            HeadwindState::Off => HeadwindState::HeartRate,
+            // HeadwindState::HeartRate => HeadwindState::Speed,
+            HeadwindState::Speed | HeadwindState::HeartRate => HeadwindState::Manual(0),
+            HeadwindState::Manual(speed) => {
+                if speed + 20 <= 100 {
+                    HeadwindState::Manual(speed + 20)
+                } else if speed < 100 {
+                    HeadwindState::Manual(100)
+                } else {
+                    HeadwindState::Off
+                }
+            }
+            HeadwindState::Sleep => HeadwindState::Manual(20),
+        }
+    }
+
+    fn previous(self) -> Self {
+        match self {
+            // HeadwindState::Off => HeadwindState::Sleep,
+            HeadwindState::Off => HeadwindState::Manual(100),
+            HeadwindState::HeartRate => HeadwindState::Off,
+            HeadwindState::Speed => HeadwindState::HeartRate,
+            HeadwindState::Manual(speed) => {
+                if speed == 0 {
+                    HeadwindState::HeartRate
+                } else if speed < 20 {
+                    HeadwindState::Manual(0)
+                } else {
+                    HeadwindState::Manual(speed - 20)
+                }
+            }
+            HeadwindState::Sleep => HeadwindState::Manual(100),
+        }
+    }
+}
+
+impl TryFrom<&[u8; 4]> for HeadwindState {
+    type Error = &'static str;
+
+    fn try_from(res: &[u8; 4]) -> Result<Self, Self::Error> {
+        let cmd_type = res[0];
+
+        match cmd_type {
+            // 0xfe seems to be confirm command
+            0xfe => {
+                let cmd = res[1];
+
+                match cmd {
+                    0x01 => Ok(HeadwindState::Off),
+                    0x02 => Ok(HeadwindState::HeartRate),
+                    0x03 => Ok(HeadwindState::Speed),
+                    0x04 => { 
+                        info!("set: {:02x} {} %", cmd, res[3]);
+                        Ok(HeadwindState::Manual(res[3]))
+                    }
+                    0x05 => Ok(HeadwindState::Sleep),
+                    _ => Err("Unknown state")
+                }
+            },
+            // 0xfd seems to be general state of the device
+            0xfd => {
+                let mode = res[3];
+                let speed = res[2];
+                info!("state notification: {:02x} {} %", mode, speed);
+
+                match mode {
+                    0x01 => Ok(HeadwindState::Off),
+                    0x02 => Ok(HeadwindState::HeartRate),
+                    0x03 => Ok(HeadwindState::Speed),
+                    0x04 => Ok(HeadwindState::Manual(speed)),
+                    0x05 => Ok(HeadwindState::Sleep),
+                    _ => Err("Unknown state")
+                }
+            }
+            _ => {
+                info!("unknown notification: {:08x}", res);
+                Err("Unknown state")
+            }
+        }
+    }
+}
+
+impl From<HeadwindState> for [u8; 4] {
+    fn from(state: HeadwindState) -> Self {
+        match state {
+            HeadwindState::Off => [0x04, 0x01, 0x00, 0x00],
+            HeadwindState::HeartRate => [0x04, 0x02, 0x00, 0x00],
+            HeadwindState::Speed => [0x04, 0x03, 0x00, 0x00],
+            HeadwindState::Manual(speed) => [0x02, speed, 0x00, 0x00],
+            HeadwindState::Sleep => [0x04, 0x05, 0x00, 0x00],
+        }
+    }
+}
+
+struct Headwind {
+    conn: Connection,
+    client: HeadwindServiceClient,
+    state: Mutex<ThreadModeRawMutex, RefCell<HeadwindState>>,
+}
+
+impl Headwind {
+    fn update_state(&self, bytes: &[u8; 4]) -> () {
+        if let Some(new_state) = HeadwindState::try_from(bytes).ok() {
+            self.state.lock(|state| {
+                *state.borrow_mut() = new_state;
+            });
+        }
+    }
+
+    async fn read_state(&self) -> Result<HeadwindState, gatt_client::ReadError> {
+        let val = unwrap!(self.client.command_read().await);
+        self.update_state(&val);
+        Ok(self.state.lock(|state| *state.borrow()))
+    }
+
+    // async fn write_state(&self) -> Result<(), gatt_client::WriteError> {
+    //     let buf: [u8; 4] = self.state.lock(|state| state.borrow().to_bytes());
+    //     self.client.command_write(&buf).await
+    // }
+
+    async fn cycle_state_up(&self) -> Result<(), gatt_client::WriteError> {
+        let buf: [u8; 4] = self.state.lock(|state| state.borrow().next().to_bytes());
+        self.client.command_write(&buf).await
+    }
+
+    async fn cycle_state_down(&self) -> Result<(), gatt_client::WriteError> {
+        let buf: [u8; 4] = self.state.lock(|state| state.borrow().previous().to_bytes());
+        self.client.command_write(&buf).await
+    }
+}
 
 #[embassy_executor::task]
 async fn softdevice_task(sd: &'static Softdevice) -> ! {
     sd.run().await
 }
 
-#[nrf_softdevice::gatt_client(uuid = "a026ee0c-0a7d-4ab3-97fa-f1500f9feb8b")]
-struct HeadwindServiceClient {
-    #[characteristic(uuid = "a026e038-0a7d-4ab3-97fa-f1500f9feb8b", read, write, notify)]
-    command: [u8; 4],
+async fn try_connect_headwind(sd: &'static Softdevice, addr: &[u8; 6]) -> Result<Headwind, gatt_client::DiscoverError> {
+    let addrs = &[&Address::new(
+        AddressType::RandomStatic,
+        *addr
+    )];
+
+    let mut config = central::ConnectConfig::default();
+    config.scan_config.whitelist = Some(addrs);
+
+    let conn = unwrap!(central::connect(sd, &config).await);
+    info!("Connected to {:x}", addr);
+
+    match gatt_client::discover(&conn).await {
+        Ok(client) => {
+            info!("Discovered");
+            let ret = Headwind { conn, client, state: Mutex::new(RefCell::new(HeadwindState::Off)) };
+            unwrap!(ret.read_state().await);
+            Ok(ret)
+        }
+        Err(e) => {
+            info!("Discover failed: {:?}", e);
+            Err(e)
+        }
+    }
+
+    // gatt_client::discover(&conn).await.map(|client| Headwind { conn, client, state: Mutex::new(RefCell::new(HeadwindState::Off)) })
+}
+
+async fn find_headwind(sd: &'static Softdevice) -> Headwind {
+    // let addrs = &[&Address::new(
+    //     AddressType::RandomStatic,
+    //     HEADWIND_ADDR,
+    // )];
+
+    let config = central::ScanConfig::default();
+
+    let addr: [u8; 6] = unwrap!(central::scan(sd, &config, |params| {
+        if !params.type_.connectable() == 0 {
+            return None;
+        }
+
+        if params.peer_addr.addr == HEADWIND_ADDR {
+            info!("Found headwind!");
+            Some(params.peer_addr.addr)
+        } else {
+            info!("Not headwind: {:x}", params.peer_addr.addr);
+            None
+        }
+    }).await);
+
+    unwrap!(try_connect_headwind(sd, &addr).await)
+}
+
+fn init_buttons() -> (Input<'static, AnyPin>, Input<'static, AnyPin>) {
+    let config = embassy_nrf::config::Config::default();
+    let p = embassy_nrf::init(config);
+
+    let button1 = Input::new(p.P0_11.degrade(), Pull::Up);
+    let button2 = Input::new(p.P0_12.degrade(), Pull::Up);
+
+    (button1, button2)
+}
+
+async fn button_task<'a>(up_btn: &'a mut Input<'_, AnyPin>, down_btn: &'a mut Input<'_, AnyPin>, headwind: &'a Headwind) {
+    loop {
+        let btn1_fut = async { up_btn.wait_for_low().await };
+        let btn2_fut = async { down_btn.wait_for_low().await };
+        pin_mut!(btn1_fut, btn2_fut);
+
+        match futures::future::select(btn1_fut, btn2_fut).await {
+            futures::future::Either::Left(_) => {
+                info!("Button 1 pressed");
+                unwrap!(headwind.cycle_state_up().await);
+            }
+            futures::future::Either::Right(_) => {
+                info!("Button 2 pressed");
+                unwrap!(headwind.cycle_state_down().await);
+            }
+        }
+    }
 }
 
 #[embassy_executor::main]
@@ -64,57 +301,46 @@ async fn main(spawner: Spawner) {
     let sd = Softdevice::enable(&config);
     unwrap!(spawner.spawn(softdevice_task(sd)));
 
-    let addrs = &[&Address::new(
-        AddressType::RandomStatic,
-        HEADWIND_ADDR,
-    )];
+    let (mut up_btn, mut down_btn) = init_buttons();
 
-    let mut config = central::ConnectConfig::default();
-    config.scan_config.whitelist = Some(addrs);
-    // TODO scan and test each for HardwareServiceClient
-    let conn = unwrap!(central::connect(sd, &config).await);
-    info!("connected");
+    loop {
+        let headwind = find_headwind(sd).await;
 
-    let client: HeadwindServiceClient = unwrap!(gatt_client::discover(&conn).await);
+        // Enable command notifications from the peripheral
+        headwind.client.command_cccd_write(true).await.unwrap();
 
-    // Read
-    // let val = unwrap!(client.command_read().await);
-    // info!("read command: {}", val);
+        // Start button future
+        let button_fut = button_task(&mut up_btn, &mut down_btn, &headwind);
 
-    // // Write, set it to 42
-    // unwrap!(client.command_write(&42).await);
-    // info!("Wrote command!");
-
-    // // Read to check it's changed
-    // let val = unwrap!(client.command_read().await);
-    // info!("read command: {}", val);
-
-    // Enable command notifications from the peripheral
-    client.command_cccd_write(true).await.unwrap();
-
-    // Receive notifications
-    gatt_client::run(&conn, &client, |event| match event {
-        HeadwindServiceClientEvent::CommandNotification(val) => {
-            let cmd_type = val[0];
-
-            match cmd_type {
-                // 0xfe seems to be confirm command
-                0xfe => {
-                    let cmd = val[1];
-                    let speed = val[3];
-                    info!("set: {:02x} {}", cmd, speed);
-                },
-                // 0xfd seems to be general state of the device
-                0xfd => {
-                    let mode = val[3];
-                    let speed = val[2];
-                    info!("state notification: {:02x} {}", mode, speed);
-                }
-                _ => {
-                    info!("unknown notification: {:08x}", val);
-                }
+        // Receive notifications
+        let gatt_fut = gatt_client::run(&headwind.conn, &headwind.client, |event| match event {
+            HeadwindServiceClientEvent::CommandNotification(val) => {
+                trace!("notification: {}", val);
+                headwind.state.lock(|state| {
+                    *state.borrow_mut() = HeadwindState::try_from(&val).unwrap_or(HeadwindState::Off);
+                });
             }
-        }
-    })
-    .await;
+        });
+
+        pin_mut!(button_fut, gatt_fut);
+
+        // Wait for either future to exit 
+        // - if the button future exits something went wrong
+        // - if the gatt future exits the connection was lost
+        let _ = match futures::future::select(button_fut, gatt_fut).await {
+            futures::future::Either::Left((_, _)) => {
+                info!("ADC encountered an error and stopped!")
+            }
+            futures::future::Either::Right((e, _)) => {
+                info!("gatt_server run exited with error: {:?}", e);
+            }
+        };
+
+        // Disconnected
+        // Since we're in a loop, we'll just try to reconnect
+        info!("Disconnected");
+        headwind.state.lock(|state| {
+            *state.borrow_mut() = HeadwindState::Off;
+        });
+    }
 }

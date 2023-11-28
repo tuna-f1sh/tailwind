@@ -4,7 +4,6 @@ BLE remote for [Wahoo Headwind](https://eu.wahoofitness.com/devices/indoor-cycli
 
 * nrf52840 board; can be ported to other nrf5XXXX but this is my target.
 * `cargo install probe-rs -F=cli`
-* `cargo install probe-run`
 
 ## 
 
