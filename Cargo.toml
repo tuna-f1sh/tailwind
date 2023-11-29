@@ -24,6 +24,9 @@ heapless = "0.7.1"
 atomic-pool = "1.0.0"
 static_cell = "1.0.0"
 
+[features]
+fixed_addr = [] # Used HEADWIND_ADDR rather than scanning for device with name HEADWIND..
+
 [patch.crates-io]
 embassy-nrf = { git = "https://github.com/embassy-rs/embassy", rev = "ce662766be80d75b5f9294ae4b792f7db252ccd3" }
 embassy-executor = { git = "https://github.com/embassy-rs/embassy", rev = "ce662766be80d75b5f9294ae4b792f7db252ccd3" }
