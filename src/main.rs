@@ -5,20 +5,19 @@
 #![macro_use]
 
 use defmt_rtt as _; // global logger
-use embassy_nrf::{self as _, Peripherals};
 // time driver
 use panic_probe as _;
 
-use core::mem;
-
 use defmt::{info, debug, *};
 use embassy_executor::Spawner;
+use embassy_nrf::{self as _, Peripherals};
 use embassy_nrf::gpio::{Input, Pin as _, AnyPin, Pull, Output, Level, OutputDrive};
 use embassy_nrf::interrupt::Priority;
 use nrf_softdevice::ble::{central, gatt_client, Address, AddressType, Connection};
 use nrf_softdevice::{raw, Softdevice};
 use core::cell::RefCell;
 use embassy_sync::blocking_mutex::Mutex;
+use embassy_sync::signal::Signal;
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use futures::pin_mut;
 
@@ -34,6 +33,7 @@ enum Error {
     UnknownState(u8),
     UnknownCommand(u8),
     UnknownNotification([u8; 4]),
+    InvalidPayload([u8; 4]),
 }
 
 #[nrf_softdevice::gatt_client(uuid = "a026ee0c-0a7d-4ab3-97fa-f1500f9feb8b")]
@@ -44,20 +44,24 @@ struct HeadwindServiceClient {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, defmt::Format)]
-#[repr(u8)]
 enum HeadwindState {
-    Off = 0x01,
-    HeartRate = 0x02,
-    Speed = 0x03,
-    Manual(u8) = 0x04,
-    Sleep = 0x05,
+    Off,
+    HeartRate,
+    Speed,
+    Manual(u8),
+    Sleep,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, defmt::Format)]
-#[repr(u8)]
-enum HeadwindCommand {
-    SetState(HeadwindState) = 0x04,
-    SetSpeed(u8) = 0x02,
+impl From<HeadwindState> for u8 {
+    fn from(state: HeadwindState) -> Self {
+        match state {
+            HeadwindState::Off => 0x01,
+            HeadwindState::HeartRate => 0x02,
+            HeadwindState::Speed => 0x03,
+            HeadwindState::Manual(_) => 0x04,
+            HeadwindState::Sleep => 0x05,
+        }
+    }
 }
 
 impl HeadwindState {
@@ -66,12 +70,10 @@ impl HeadwindState {
             // off -> hr -> manual .. speed -> off ...
             HeadwindState::Off => HeadwindState::HeartRate,
             // HeadwindState::HeartRate => HeadwindState::Speed,
-            HeadwindState::Speed | HeadwindState::HeartRate => HeadwindState::Manual(0xFF),
+            HeadwindState::Speed | HeadwindState::HeartRate => HeadwindState::Manual(0),
             HeadwindState::Manual(speed) => {
-                if speed + 20 <= 100 {
-                    HeadwindState::Manual(speed + 20)
-                } else if speed < 100 {
-                    HeadwindState::Manual(100)
+                if speed < 100 {
+                    HeadwindState::Manual(speed + (20 - speed % 20))
                 } else {
                     HeadwindState::Off
                 }
@@ -84,19 +86,17 @@ impl HeadwindState {
         match self {
             // off <- hr <- manual .. speed <- off ...
             // HeadwindState::Off => HeadwindState::Sleep,
-            HeadwindState::Off => HeadwindState::Manual(0xFF),
+            HeadwindState::Off => HeadwindState::Manual(100),
             HeadwindState::HeartRate => HeadwindState::Off,
             HeadwindState::Speed => HeadwindState::HeartRate,
             HeadwindState::Manual(speed) => {
                 if speed == 0 {
                     HeadwindState::HeartRate
-                } else if speed < 20 {
-                    HeadwindState::Manual(0)
                 } else {
-                    HeadwindState::Manual(speed - 20)
+                    HeadwindState::Manual(speed - (speed % 20))
                 }
             }
-            HeadwindState::Sleep => HeadwindState::Manual(0xFF),
+            HeadwindState::Sleep => HeadwindState::Manual(100),
         }
     }
 }
@@ -132,13 +132,12 @@ impl TryFrom<&[u8; 4]> for HeadwindState {
             // 0xfd seems to be general state of the device
             0xfd => {
                 let mode = res[3];
-                let speed = res[2];
 
                 match mode {
                     0x01 => Ok(HeadwindState::Off),
                     0x02 => Ok(HeadwindState::HeartRate),
                     0x03 => Ok(HeadwindState::Speed),
-                    0x04 => Ok(HeadwindState::Manual(speed)),
+                    0x04 => Ok(HeadwindState::Manual(res[2])),
                     0x05 => Ok(HeadwindState::Sleep),
                     _ => Err(Error::UnknownState(mode))
                 }
@@ -153,19 +152,68 @@ impl TryFrom<&[u8; 4]> for HeadwindState {
 
 impl From<HeadwindState> for [u8; 4] {
     fn from(state: HeadwindState) -> Self {
-        match state {
-            HeadwindState::Off => [0x04, 0x01, 0x00, 0x00],
-            HeadwindState::HeartRate => [0x04, 0x02, 0x00, 0x00],
-            HeadwindState::Speed => [0x04, 0x03, 0x00, 0x00],
-            HeadwindState::Manual(speed) => {
-                // 0xff is internal flag to enter manual mode; will use last setpoint
-                if speed == 0xFF {
-                    [0x04, 0x04, 0x00, 0x00]
-                } else {
-                    [0x02, speed, 0x00, 0x00]
+        [0x04, u8::from(state), 0x00, 0x00]
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, defmt::Format)]
+enum HeadwindCommand {
+    SetState(HeadwindState),
+    SetSpeed(u8),
+}
+
+impl From<HeadwindCommand> for u8 {
+    fn from(cmd: HeadwindCommand) -> Self {
+        match cmd {
+            HeadwindCommand::SetSpeed(_) => 0x02,
+            HeadwindCommand::SetState(_) => 0x04,
+        }
+    }
+}
+
+impl TryFrom<&[u8; 4]> for HeadwindCommand {
+    type Error = Error;
+
+    fn try_from(res: &[u8; 4]) -> Result<Self, Self::Error> {
+        let cmd_type = res[0];
+
+        match cmd_type {
+            0xfe => {
+                let cmd = res[1];
+
+                match cmd {
+                    // set speed
+                    0x02 => Ok(HeadwindCommand::SetSpeed(res[3])),
+                    // set state
+                    0x04 => {
+                        match res[3] {
+                            0x01 => Ok(HeadwindCommand::SetState(HeadwindState::Off)),
+                            0x02 => Ok(HeadwindCommand::SetState(HeadwindState::HeartRate)),
+                            0x03 => Ok(HeadwindCommand::SetState(HeadwindState::Speed)),
+                            0x04 => Ok(HeadwindCommand::SetState(HeadwindState::Manual(res[2]))),
+                            0x05 => Ok(HeadwindCommand::SetState(HeadwindState::Sleep)),
+                            _ => Err(Error::UnknownState(res[3]))
+                        }
+                    }
+                    // have seen 0x03, 0x05, 0x06 with App but not need for our use - probably device info
+                    _ => Err(Error::UnknownCommand(cmd))
                 }
+            },
+            // state update is not a command confirmation
+            0xfd => Err(Error::InvalidPayload(*res)),
+            _ => {
+                warn!("Unknown command: {:08x}", res);
+                Err(Error::UnknownNotification(*res))
             }
-            HeadwindState::Sleep => [0x04, 0x05, 0x00, 0x00],
+        }
+    }
+}
+
+impl From<HeadwindCommand> for [u8; 4] {
+    fn from(cmd: HeadwindCommand) -> Self {
+        match cmd {
+            HeadwindCommand::SetState(state) => state.into(),
+            HeadwindCommand::SetSpeed(speed) => [u8::from(cmd), speed, 0x00, 0x00],
         }
     }
 }
@@ -177,6 +225,7 @@ struct Headwind {
 }
 
 impl Headwind {
+    /// Set the local [`HeadwindState`]
     fn set_state(&self, new_state: HeadwindState) -> () {
         self.state.lock(|state| {
             if *state.borrow() != new_state {
@@ -186,7 +235,7 @@ impl Headwind {
         });
     }
 
-    /// Update the local state from read/notification command bytes
+    /// Update the local [`HeadwindState`] from read/notification command bytes
     fn update_state(&self, bytes: &[u8; 4]) -> () {
         match HeadwindState::try_from(bytes) {
             Ok(new_state) => self.set_state(new_state),
@@ -194,38 +243,77 @@ impl Headwind {
         }
     }
 
-    /// Read the current state from Headwind and update the local state
+    /// Read the current [`HeadwindState`] from Headwind and update the local state
     async fn read_state(&self) -> Result<HeadwindState, Error> {
         let val = self.client.command_read().await.map_err(|e| Error::Read(e))?;
         self.update_state(&val);
         Ok(self.state.lock(|state| *state.borrow()))
     }
 
-    /// Request the current state from Headwind by writing to the command characteristic
-    async fn request_state(&self) -> Result<(), Error> {
-        let buf: [u8; 4] = self.state.lock(|state| {
-            let s = *state.borrow();
-            info!("Request state: {:?}", s);
-            s.into()
-        });
-        // Has to be try_write_without_response because gatt_client::run is attached to SoftDevice Portal
+    /// Request the Headwind enters the [`HeadwindState`] by writing to the command characteristic
+    ///
+    /// Note that it does not wait for a response, but the response will be received as a notification
+    async fn request_state(&self, state: HeadwindState) -> Result<(), Error> {
+        info!("Request state: {:?}", state);
+        self.send_command(HeadwindCommand::SetState(state)).await
+    }
+
+    /// Request the Manual mode `speed` by writing to the command
+    /// characteristic
+    ///
+    /// Note that the Headwind will not enter Manual mode with the SetSpeed
+    /// command but will change it for when in that mode; if in Manual mode,
+    /// the speed change will be reflected, otherwise not.
+    async fn request_speed(&self, speed: u8) -> Result<(), Error> {
+        info!("Request speed: {:?}", speed);
+        self.send_command(HeadwindCommand::SetSpeed(speed)).await
+    }
+
+    /// Send a [`HeadwindCommand`] to the Headwind by writing to the command characteristic
+    async fn send_command(&self, cmd: HeadwindCommand) -> Result<(), Error> {
+        debug!("Sending command: {:?}", cmd);
+        let buf: [u8; 4] = cmd.into();
         self.client.command_try_write_without_response(&buf).map_err(|e| Error::Write(e))
     }
 
+    /// Request the Headwind enters the next [`HeadwindState`] by writing to the command characteristic
     async fn next_state(&self) -> Result<(), Error> {
-        self.state.lock(|state| {
+        let (cur, next) = self.state.lock(|state| {
             let next_state = state.borrow().next();
             *state.borrow_mut() = next_state;
+            (*state.borrow(), next_state)
         });
-        self.request_state().await
+
+        // For entering Manual mode with cycle, set the speed too
+        match (cur, next) {
+            (HeadwindState::Manual(_), HeadwindState::Manual(_)) => (),
+            (_, HeadwindState::Manual(speed)) => {
+                self.request_speed(speed).await?;
+            },
+            (_, _) => ()
+        };
+
+        self.request_state(next).await
     }
 
+    /// Request the Headwind enters the previous [`HeadwindState`] by writing to the command characteristic
     async fn previous_state(&self) -> Result<(), Error> {
-        self.state.lock(|state| {
-            let prev_state = state.borrow().previous();
-            *state.borrow_mut() = prev_state;
+        let (cur, next) = self.state.lock(|state| {
+            let next_state = state.borrow().next();
+            *state.borrow_mut() = next_state;
+            (*state.borrow(), next_state)
         });
-        self.request_state().await
+
+        // For entering Manual mode with cycle, set the speed too
+        match (cur, next) {
+            (HeadwindState::Manual(_), HeadwindState::Manual(_)) => (),
+            (_, HeadwindState::Manual(speed)) => {
+                self.request_speed(speed).await?;
+            },
+            (_, _) => ()
+        };
+
+        self.request_state(next).await
     }
 }
 
@@ -269,11 +357,13 @@ async fn try_connect_headwind(sd: &'static Softdevice, addr: &[u8; 6]) -> Result
 
 #[cfg(feature = "fixed_addr")]
 async fn find_headwind(sd: &'static Softdevice) -> Result<Headwind, Error> {
+    info!("Attmpting connection to Headwind with fixed address {:02x}", HEADWIND_ADDR);
     try_connect_headwind(sd, &HEADWIND_ADDR).await
 }
 
 #[cfg(not(feature = "fixed_addr"))]
 async fn find_headwind(sd: &'static Softdevice) -> Result<Headwind, Error> {
+    info!("Scanning for devices with name starting: 'HEADWIND'");
     let config = central::ScanConfig::default();
 
     let addr: [u8; 6] = unwrap!(central::scan(sd, &config, |params| unsafe {
@@ -322,21 +412,6 @@ fn init_peripherals() -> Peripherals {
     embassy_nrf::init(config)
 }
 
-fn init_buttons() -> (Input<'static, AnyPin>, Input<'static, AnyPin>) {
-    let p = init_peripherals();
-    // nrf52540dk buttons - also p0.24 and p0.25
-    let button1 = Input::new(p.P0_11.degrade(), Pull::Up);
-    let button2 = Input::new(p.P0_12.degrade(), Pull::Up);
-
-    (button1, button2)
-}
-
-fn init_leds() -> (Output<'static, AnyPin>, Output<'static, AnyPin>) {
-    let p = init_peripherals();
-    (Output::new(p.P0_13.degrade(), Level::High, OutputDrive::Standard),
-    Output::new(p.P0_14.degrade(), Level::High, OutputDrive::Standard))
-}
-
 async fn button_task<'a>(up_btn: &'a mut Input<'_, AnyPin>, down_btn: &'a mut Input<'_, AnyPin>, headwind: &'a Headwind) {
     loop {
         let up_fut = async { up_btn.wait_for_falling_edge().await };
@@ -356,13 +431,81 @@ async fn button_task<'a>(up_btn: &'a mut Input<'_, AnyPin>, down_btn: &'a mut In
     }
 }
 
+async fn blink_led(led: &mut Output<'_, AnyPin>, on_period: u64, off_period: Option<u64>) {
+    loop {
+        led.set_low();
+        embassy_time::Timer::after(embassy_time::Duration::from_millis(on_period)).await;
+        led.set_high();
+        // If off_period keep looping forever, otherwise break
+        if let Some(off_period) = off_period {
+            embassy_time::Timer::after(embassy_time::Duration::from_millis(off_period)).await;
+        } else {
+            break;
+        }
+    }
+}
+
+static LED_SIGNAL: Signal<ThreadModeRawMutex, u8> = Signal::new();
+
+#[embassy_executor::task]
+async fn led_task(rpin: AnyPin, gpin: AnyPin, bpin: AnyPin) {
+    let rled = Output::new(rpin, Level::High, OutputDrive::Standard);
+    let gled = Output::new(gpin, Level::High, OutputDrive::Standard);
+    let bled = Output::new(bpin, Level::High, OutputDrive::Standard);
+    pin_mut!(rled, gled, bled);
+
+    loop {
+        let blink_fut = blink_led(&mut bled, 500, Some(500));
+        pin_mut!(blink_fut);
+
+        match futures::future::select(LED_SIGNAL.wait(), blink_fut).await {
+            futures::future::Either::Left((val, _)) => {
+                match val {
+                    1 => {
+                        info!("LED red");
+                        // off
+                        // drop(blink_fut);
+                        // red
+                        rled.set_low();
+                    },
+                    2 => {
+                        info!("LED red");
+                        // off
+                        // drop(blink_fut);
+                        // green
+                        gled.set_low();
+                    },
+                    3 => {
+                        info!("LED red");
+                        // off
+                        // drop(blink_fut);
+                        // blue
+                        // bled.set_low();
+                    },
+                    _ => {
+                        info!("LED off");
+                        // off
+                        // drop(blink_fut);
+                        rled.set_high();
+                        gled.set_high();
+                        // bled.set_high();
+                    },
+                }
+            }
+            _ => ()
+        }
+    }
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     info!("Tailwind Remote");
 
-    let (mut up_btn, mut down_btn) = init_buttons();
-    // let (mut led1, mut led2) = init_leds();
-    // pin_mut!(up_btn, down_btn);
+    // Initialize peripherals; GPIOs and SoftDevice
+    let p = init_peripherals();
+    // nrf52540dk buttons - also p0.24 and p0.25
+    let mut up_btn = Input::new(p.P0_11.degrade(), Pull::Up); // 11 on Feather/Button 1 on DK
+    let mut down_btn = Input::new(p.P0_12.degrade(), Pull::Up); // SCK on Feather/Button 2 on DK
 
     let config = nrf_softdevice::Config {
         clock: Some(raw::nrf_clock_lf_cfg_t {
@@ -377,18 +520,27 @@ async fn main(spawner: Spawner) {
         }),
         conn_gatt: Some(raw::ble_gatt_conn_cfg_t { att_mtu: 23 }),
         gatts_attr_tab_size: Some(raw::ble_gatts_cfg_attr_tab_size_t { attr_tab_size: 32768 }),
-        // gap_role_count: Some(raw::ble_gap_cfg_role_count_t {
-        //     adv_set_count: 1,
-        //     periph_role_count: 3,
-        //     central_role_count: 3,
-        //     central_sec_count: 0,
-        //     _bitfield_1: raw::ble_gap_cfg_role_count_t::new_bitfield_1(0),
-        // }),
+        gap_role_count: Some(raw::ble_gap_cfg_role_count_t {
+            adv_set_count: 0, // don't need advertising
+            periph_role_count: 0, // don't need peripheral
+            central_role_count: 1, // one central for connecting to headwind
+            central_sec_count: 0,
+            _bitfield_1: raw::ble_gap_cfg_role_count_t::new_bitfield_1(0),
+        }),
         ..Default::default()
     };
 
     let sd = Softdevice::enable(&config);
     unwrap!(spawner.spawn(softdevice_task(sd)));
+
+    // LED task
+    let rpin = p.P0_13.degrade(); // MOSI on Feather/LED1 on DK
+    let gpin = p.P0_14.degrade(); // MISO on Feather/LED2 on DK
+    let bpin = p.P0_15.degrade(); // 15 on Feather/LED3 on DK
+    unwrap!(spawner.spawn(led_task(rpin, gpin, bpin)));
+
+    embassy_time::Timer::after(embassy_time::Duration::from_millis(5000)).await;
+    LED_SIGNAL.signal(1);
 
     loop {
         match find_headwind(sd).await {
@@ -426,7 +578,7 @@ async fn main(spawner: Spawner) {
                 info!("Disconnected");
             }
             Err(e) => {
-                error!("Failed to connect to headwind: {:?}", e);
+                error!("Failed to connect to Headwind: {:?}", e);
             }
         }
     }

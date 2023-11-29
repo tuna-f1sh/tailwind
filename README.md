@@ -13,6 +13,10 @@ Cycles modes, speed setpoint in sync with front-panel/App control.
 2. Program SoftDevice with: `probe-rs download --chip nrf52840 --format hex s140_nrf52_7.X.X_softdevice.hex`
 3. Run `cargo run`
 
+By default the DEFMT_LOG level is 'info' (set in ./cargo/config). For debugging use `DEFMT_LOG=debug cargo run`.
+
+To flash build: `cargo flash --release --chip nRF52840_xxAA`.
+
 ## Usage
 
 The default build will scan for BLE devices and use the first device with advertisement data name (0x09) starting with 'HEADWIND' (default Wahoo Headwind name) - the Headwind service UUID is not in advertisement packet unfortunately.
