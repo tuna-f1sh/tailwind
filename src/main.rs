@@ -23,17 +23,23 @@ use futures::pin_mut;
 
 #[cfg(feature = "fixed_addr")]
 const HEADWIND_ADDR: [u8; 6] = [0xb9, 0xb1, 0x4f, 0x9d, 0x10, 0xe3];
+const SPEED_STEP: u8 = 25;
 
 #[derive(Debug, defmt::Format)]
+#[allow(dead_code)]
 enum Error {
     Connection(central::ConnectError),
     Discover(gatt_client::DiscoverError),
     Read(gatt_client::ReadError),
-    Write(gatt_client::TryWriteError),
+    Write(gatt_client::WriteError),
+    TryWrite(gatt_client::TryWriteError),
     UnknownState(u8),
     UnknownCommand(u8),
     UnknownNotification([u8; 4]),
     InvalidPayload([u8; 4]),
+    InvalidSpeed(u8),
+    Nak,
+    Timeout,
 }
 
 #[nrf_softdevice::gatt_client(uuid = "a026ee0c-0a7d-4ab3-97fa-f1500f9feb8b")]
@@ -67,36 +73,38 @@ impl From<HeadwindState> for u8 {
 impl HeadwindState {
     fn next(self) -> Self {
         match self {
-            // off -> hr -> manual .. speed -> off ...
+            // off -> hr -> manual(speed step,100,step) -> hr ...
             HeadwindState::Off => HeadwindState::HeartRate,
-            // HeadwindState::HeartRate => HeadwindState::Speed,
-            HeadwindState::Speed | HeadwindState::HeartRate => HeadwindState::Manual(0),
+            HeadwindState::Speed |
+                HeadwindState::HeartRate |
+                HeadwindState::Sleep |
+                HeadwindState::Manual(0xFF) => HeadwindState::Manual(SPEED_STEP),
             HeadwindState::Manual(speed) => {
                 if speed < 100 {
-                    HeadwindState::Manual(speed + (20 - speed % 20))
+                    HeadwindState::Manual(speed + (SPEED_STEP - speed % SPEED_STEP))
                 } else {
-                    HeadwindState::Off
+                    HeadwindState::HeartRate
                 }
             }
-            HeadwindState::Sleep => HeadwindState::Manual(20),
         }
     }
 
     fn previous(self) -> Self {
         match self {
-            // off <- hr <- manual .. speed <- off ...
-            // HeadwindState::Off => HeadwindState::Sleep,
-            HeadwindState::Off => HeadwindState::Manual(100),
-            HeadwindState::HeartRate => HeadwindState::Off,
+            // off <- hr <- manual(speed, 100,step,-step) <- off ...
+            HeadwindState::Off |
+                HeadwindState::Sleep |
+                HeadwindState::HeartRate |
+                HeadwindState::Manual(0xFF)  => HeadwindState::Manual(100),
+            // HeadwindState::HeartRate => HeadwindState::Off,
             HeadwindState::Speed => HeadwindState::HeartRate,
             HeadwindState::Manual(speed) => {
-                if speed == 0 {
+                if speed < SPEED_STEP {
                     HeadwindState::HeartRate
                 } else {
-                    HeadwindState::Manual(speed - (speed % 20))
+                    HeadwindState::Manual(speed - SPEED_STEP)
                 }
             }
-            HeadwindState::Sleep => HeadwindState::Manual(100),
         }
     }
 }
@@ -110,26 +118,18 @@ impl TryFrom<&[u8; 4]> for HeadwindState {
         match cmd_type {
             // 0xfe seems to be confirm command
             0xfe => {
-                let cmd = res[1];
-
+                warn!("Should not pass HeadwindState from confirm command {:#02x}, does not contain speed setpoint!", res);
+                let cmd = HeadwindCommand::try_from(res)?;
                 match cmd {
-                    0x02 => { 
-                        Ok(HeadwindState::Manual(res[3]))
-                    },
-                    0x04 => {
-                        match res[3] {
-                            0x01 => Ok(HeadwindState::Off),
-                            0x02 => Ok(HeadwindState::HeartRate),
-                            0x03 => Ok(HeadwindState::Speed),
-                            0x04 => Ok(HeadwindState::Manual(res[2])),
-                            0x05 => Ok(HeadwindState::Sleep),
-                            _ => Err(Error::UnknownState(res[3]))
-                        }
-                    }
-                    _ => Err(Error::UnknownCommand(cmd))
+                    HeadwindCommand::SetState(state) => Ok(state),
+                    HeadwindCommand::SetSpeed(speed) => Ok(HeadwindState::Manual(speed)),
                 }
             },
             // 0xfd seems to be general state of the device
+            // Annoyingly it's not really a notify but cyclic and the notified state can be outdated
+            // and cause potentially a race condition if notify old state between button presses but this is good enough...
+            // Alternatively would be not using notify at all and read state before each action
+            // Best would be only using notify for ACK/read before action but that doesn't seem to be possible waiting on same characteristic Portal
             0xfd => {
                 let mode = res[3];
 
@@ -143,7 +143,7 @@ impl TryFrom<&[u8; 4]> for HeadwindState {
                 }
             }
             _ => {
-                warn!("Unknown notification: {:08x}", res);
+                warn!("Unknown notification: {:#02x}", res);
                 Err(Error::UnknownNotification(*res))
             }
         }
@@ -178,9 +178,9 @@ impl TryFrom<&[u8; 4]> for HeadwindCommand {
         let cmd_type = res[0];
 
         match cmd_type {
+            // command confirmation
             0xfe => {
                 let cmd = res[1];
-
                 match cmd {
                     // set speed
                     0x02 => Ok(HeadwindCommand::SetSpeed(res[3])),
@@ -190,7 +190,8 @@ impl TryFrom<&[u8; 4]> for HeadwindCommand {
                             0x01 => Ok(HeadwindCommand::SetState(HeadwindState::Off)),
                             0x02 => Ok(HeadwindCommand::SetState(HeadwindState::HeartRate)),
                             0x03 => Ok(HeadwindCommand::SetState(HeadwindState::Speed)),
-                            0x04 => Ok(HeadwindCommand::SetState(HeadwindState::Manual(res[2]))),
+                            // State change confirm doesn't contain speed so put an invalid flag - could be Option u8 instead but...
+                            0x04 => Ok(HeadwindCommand::SetState(HeadwindState::Manual(0xFF))),
                             0x05 => Ok(HeadwindCommand::SetState(HeadwindState::Sleep)),
                             _ => Err(Error::UnknownState(res[3]))
                         }
@@ -222,16 +223,25 @@ struct Headwind {
     conn: Connection,
     client: HeadwindServiceClient,
     state: Mutex<ThreadModeRawMutex, RefCell<HeadwindState>>,
+    command_signal: Signal<ThreadModeRawMutex, HeadwindCommand>,
 }
 
 impl Headwind {
     /// Set the local [`HeadwindState`]
     fn set_state(&self, new_state: HeadwindState) -> () {
         self.state.lock(|state| {
-            if *state.borrow() != new_state {
-                *state.borrow_mut() = new_state;
-                info!("Headwind state updated: {:?}", new_state);
+            let old_state = *state.borrow();
+            match (old_state, new_state) {
+                // HACK: If we're in manual mode and the new state is manual with invalid speed, keep the old speed
+                (HeadwindState::Manual(old), HeadwindState::Manual(0xff)) => {
+                    let new_state = HeadwindState::Manual(old);
+                    *state.borrow_mut() = new_state;
+                },
+                _ => {
+                    *state.borrow_mut() = new_state;
+                }
             }
+            info!("Headwind set state: {:?}", new_state);
         });
     }
 
@@ -261,59 +271,96 @@ impl Headwind {
     /// Request the Manual mode `speed` by writing to the command
     /// characteristic
     ///
-    /// Note that the Headwind will not enter Manual mode with the SetSpeed
-    /// command but will change it for when in that mode; if in Manual mode,
-    /// the speed change will be reflected, otherwise not.
+    /// Note that the Headwind will not enter Manual mode with the SetSpeed so
+    /// should be in that state before request
     async fn request_speed(&self, speed: u8) -> Result<(), Error> {
-        info!("Request speed: {:?}", speed);
-        self.send_command(HeadwindCommand::SetSpeed(speed)).await
+        if speed <= 100 {
+            info!("Request speed: {:?}", speed);
+            self.send_command(HeadwindCommand::SetSpeed(speed)).await
+        } else {
+            Err(Error::InvalidSpeed(speed))
+        }
     }
 
     /// Send a [`HeadwindCommand`] to the Headwind by writing to the command characteristic
+    /// 
+    /// Waits for a response ACK from the Headwind and returns an error if the response is not the same
     async fn send_command(&self, cmd: HeadwindCommand) -> Result<(), Error> {
-        debug!("Sending command: {:?}", cmd);
         let buf: [u8; 4] = cmd.into();
-        self.client.command_try_write_without_response(&buf).map_err(|e| Error::Write(e))
+        debug!("Sending command: {:?}/{:#02x}", cmd, buf);
+        self.client.command_write_without_response(&buf).await.map_err(|e| Error::Write(e))?;
+
+        // wait for ACK - Headwind doesn't seem to like set speed if not in manual mode
+        match futures::future::select(embassy_time::Timer::after(embassy_time::Duration::from_millis(1000)), self.command_signal.wait()).await {
+            futures::future::Either::Left(_) => {
+                error!("Command timeout: {:?}", cmd);
+                Err(Error::Timeout)
+            }
+            futures::future::Either::Right((ack, _)) => {
+                match (cmd, ack) {
+                    // HACK: ack for state will not contain speed
+                    (HeadwindCommand::SetState(HeadwindState::Manual(_)), HeadwindCommand::SetState(HeadwindState::Manual(_))) => {
+                        Ok(())
+                    },
+                    _ => {
+                        if ack == cmd {
+                            Ok(())
+                        } else {
+                            error!("Command NAK: {:?} != {:?}", ack, cmd);
+                            Err(Error::Nak)
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Request the Headwind enters the next [`HeadwindState`] by writing to the command characteristic
     async fn next_state(&self) -> Result<(), Error> {
         let (cur, next) = self.state.lock(|state| {
             let next_state = state.borrow().next();
+            let cur_state = *state.borrow();
             *state.borrow_mut() = next_state;
-            (*state.borrow(), next_state)
+            (cur_state, next_state)
         });
 
         // For entering Manual mode with cycle, set the speed too
         match (cur, next) {
-            (HeadwindState::Manual(_), HeadwindState::Manual(_)) => (),
+            (HeadwindState::Manual(_), HeadwindState::Manual(speed)) => {
+                self.request_speed(speed).await
+            }
             (_, HeadwindState::Manual(speed)) => {
-                self.request_speed(speed).await?;
+                self.request_state(next).await?;
+                self.request_speed(speed).await
             },
-            (_, _) => ()
-        };
-
-        self.request_state(next).await
+            (_, _) => {
+                self.request_state(next).await
+            }
+        }
     }
 
     /// Request the Headwind enters the previous [`HeadwindState`] by writing to the command characteristic
     async fn previous_state(&self) -> Result<(), Error> {
         let (cur, next) = self.state.lock(|state| {
-            let next_state = state.borrow().next();
+            let next_state = state.borrow().previous();
+            let cur_state = *state.borrow();
             *state.borrow_mut() = next_state;
-            (*state.borrow(), next_state)
+            (cur_state, next_state)
         });
 
         // For entering Manual mode with cycle, set the speed too
         match (cur, next) {
-            (HeadwindState::Manual(_), HeadwindState::Manual(_)) => (),
+            (HeadwindState::Manual(_), HeadwindState::Manual(speed)) => {
+                self.request_speed(speed).await
+            }
             (_, HeadwindState::Manual(speed)) => {
-                self.request_speed(speed).await?;
+                self.request_state(next).await?;
+                self.request_speed(speed).await
             },
-            (_, _) => ()
-        };
-
-        self.request_state(next).await
+            (_, _) => {
+                self.request_state(next).await
+            }
+        }
     }
 }
 
@@ -337,9 +384,10 @@ async fn try_connect_headwind(sd: &'static Softdevice, addr: &[u8; 6]) -> Result
 
             match gatt_client::discover(&conn).await {
                 Ok(client) => {
-                    let ret = Headwind { conn, client, state: Mutex::new(RefCell::new(HeadwindState::Off)) };
-                    ret.read_state().await?;
-                    info!("Headwind created in state: {:?}", ret.state.lock(|state| *state.borrow()));
+                    let ret = Headwind { conn, client, state: Mutex::new(RefCell::new(HeadwindState::Off)), command_signal: Signal::new() };
+                    // Read state updates internal state
+                    let state = ret.read_state().await?;
+                    info!("Headwind created in state: {:?}", state);
                     Ok(ret)
                 }
                 Err(e) => {
@@ -421,11 +469,15 @@ async fn button_task<'a>(up_btn: &'a mut Input<'_, AnyPin>, down_btn: &'a mut In
         match futures::future::select(up_fut, down_fut).await {
             futures::future::Either::Left(_) => {
                 debug!("Up pressed");
-                unwrap!(headwind.previous_state().await);
+                if let Err(e) = headwind.next_state().await {
+                    error!("Failed to set next state: {:?}", e);
+                }
             }
             futures::future::Either::Right(_) => {
                 debug!("Down pressed");
-                unwrap!(headwind.next_state().await);
+                if let Err(e) = headwind.previous_state().await {
+                    error!("Failed to set previous state: {:?}", e);
+                }
             }
         }
     }
@@ -458,37 +510,19 @@ async fn led_task(rpin: AnyPin, gpin: AnyPin, bpin: AnyPin) {
         let blink_fut = blink_led(&mut bled, 500, Some(500));
         pin_mut!(blink_fut);
 
+        // TODO LED commands
         match futures::future::select(LED_SIGNAL.wait(), blink_fut).await {
             futures::future::Either::Left((val, _)) => {
                 match val {
                     1 => {
-                        info!("LED red");
-                        // off
-                        // drop(blink_fut);
-                        // red
                         rled.set_low();
                     },
                     2 => {
-                        info!("LED red");
-                        // off
-                        // drop(blink_fut);
-                        // green
                         gled.set_low();
                     },
-                    3 => {
-                        info!("LED red");
-                        // off
-                        // drop(blink_fut);
-                        // blue
-                        // bled.set_low();
-                    },
                     _ => {
-                        info!("LED off");
-                        // off
-                        // drop(blink_fut);
                         rled.set_high();
                         gled.set_high();
-                        // bled.set_high();
                     },
                 }
             }
@@ -504,8 +538,8 @@ async fn main(spawner: Spawner) {
     // Initialize peripherals; GPIOs and SoftDevice
     let p = init_peripherals();
     // nrf52540dk buttons - also p0.24 and p0.25
-    let mut up_btn = Input::new(p.P0_11.degrade(), Pull::Up); // 11 on Feather/Button 1 on DK
-    let mut down_btn = Input::new(p.P0_12.degrade(), Pull::Up); // SCK on Feather/Button 2 on DK
+    let mut down_btn = Input::new(p.P0_11.degrade(), Pull::Up); // 11 on Feather/Button 1 on DK
+    let mut up_btn = Input::new(p.P0_12.degrade(), Pull::Up); // SCK on Feather/Button 2 on DK
 
     let config = nrf_softdevice::Config {
         clock: Some(raw::nrf_clock_lf_cfg_t {
@@ -539,14 +573,13 @@ async fn main(spawner: Spawner) {
     let bpin = p.P0_15.degrade(); // 15 on Feather/LED3 on DK
     unwrap!(spawner.spawn(led_task(rpin, gpin, bpin)));
 
-    embassy_time::Timer::after(embassy_time::Duration::from_millis(5000)).await;
-    LED_SIGNAL.signal(1);
-
     loop {
         match find_headwind(sd).await {
             Ok(headwind) => {
                 // Enable command notifications from the peripheral
                 headwind.client.command_cccd_write(true).await.unwrap();
+
+                LED_SIGNAL.signal(1);
 
                 // Start button future
                 let button_fut = button_task(&mut up_btn, &mut down_btn, &headwind);
@@ -555,7 +588,19 @@ async fn main(spawner: Spawner) {
                 let gatt_fut = gatt_client::run(&headwind.conn, &headwind.client, |event| match event {
                     HeadwindServiceClientEvent::CommandNotification(val) => {
                         debug!("notification: {:#02x}", val);
-                        headwind.update_state(&val);
+                        // Only update state if it's a state update (0xfd)
+                        if val[0] == 0xfd {
+                            headwind.update_state(&val);
+                        // Else signal the command ACK
+                        } else {
+                            match HeadwindCommand::try_from(&val) {
+                                Ok(cmd) => {
+                                    debug!("Confirmed command: {:?}", cmd);
+                                    headwind.command_signal.signal(cmd);
+                                }
+                                Err(e) => error!("Failed to parse command: {:?}", e)
+                            }
+                        }
                     }
                 });
 
@@ -572,6 +617,8 @@ async fn main(spawner: Spawner) {
                         debug!("gatt_server run exited with: {:?}", e);
                     }
                 };
+
+                LED_SIGNAL.signal(0);
 
                 // Disconnected
                 // Since we're in a loop, we'll just try to reconnect
