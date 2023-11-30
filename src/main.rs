@@ -265,7 +265,10 @@ impl Headwind {
     /// Note that it does not wait for a response, but the response will be received as a notification
     async fn request_state(&self, state: HeadwindState) -> Result<(), Error> {
         info!("Request state: {:?}", state);
-        self.send_command(HeadwindCommand::SetState(state)).await
+        self.send_command(HeadwindCommand::SetState(state)).await?;
+        // Set local since it was ACK'd
+        self.set_state(state);
+        Ok(())
     }
 
     /// Request the Manual mode `speed` by writing to the command
@@ -315,52 +318,35 @@ impl Headwind {
         }
     }
 
-    /// Request the Headwind enters the next [`HeadwindState`] by writing to the command characteristic
-    async fn next_state(&self) -> Result<(), Error> {
-        let (cur, next) = self.state.lock(|state| {
-            let next_state = state.borrow().next();
-            let cur_state = *state.borrow();
-            *state.borrow_mut() = next_state;
-            (cur_state, next_state)
-        });
+    async fn change_state(&self, new_state: HeadwindState) -> Result<(), Error> {
+        let current = self.state.lock(|state| *state.borrow());
 
         // For entering Manual mode with cycle, set the speed too
-        match (cur, next) {
+        match (current, new_state) {
             (HeadwindState::Manual(_), HeadwindState::Manual(speed)) => {
-                self.request_speed(speed).await
+                self.request_speed(speed).await?;
+                // Set the state since request speed will not but we know are in manual mode
+                self.set_state(new_state);
+                Ok(())
             }
             (_, HeadwindState::Manual(speed)) => {
-                self.request_state(next).await?;
+                self.request_state(new_state).await?;
                 self.request_speed(speed).await
             },
             (_, _) => {
-                self.request_state(next).await
+                self.request_state(new_state).await
             }
         }
     }
 
+    /// Request the Headwind enters the next [`HeadwindState`] by writing to the command characteristic
+    async fn next_state(&self) -> Result<(), Error> {
+        self.change_state(self.state.lock(|state| state.borrow().next())).await
+    }
+
     /// Request the Headwind enters the previous [`HeadwindState`] by writing to the command characteristic
     async fn previous_state(&self) -> Result<(), Error> {
-        let (cur, next) = self.state.lock(|state| {
-            let next_state = state.borrow().previous();
-            let cur_state = *state.borrow();
-            *state.borrow_mut() = next_state;
-            (cur_state, next_state)
-        });
-
-        // For entering Manual mode with cycle, set the speed too
-        match (cur, next) {
-            (HeadwindState::Manual(_), HeadwindState::Manual(speed)) => {
-                self.request_speed(speed).await
-            }
-            (_, HeadwindState::Manual(speed)) => {
-                self.request_state(next).await?;
-                self.request_speed(speed).await
-            },
-            (_, _) => {
-                self.request_state(next).await
-            }
-        }
+        self.change_state(self.state.lock(|state| state.borrow().previous())).await
     }
 }
 
