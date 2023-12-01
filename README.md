@@ -25,7 +25,7 @@ To use a fixed address, change the `HEADWIND_ADDR` const in './src/main.rs' and 
 
 Once connected, the buttons control the Headwind mode:
 
-* Button 1: Next mode = Off -> Heartrate -> Manual .. 0..100 step 25 -> Off.
-* Button 2: Previous mode = Off <- Heartrate <- Manual .. 0..100 step -25 <- Off.
+* Button 1: Next mode = Off -> Heartrate -> Manual .. STEP,100,STEP -> Off.
+* Button 2: Previous mode = Off <- Heartrate <- Manual .. 100,STEP,-STEP <- Off.
 
 The current operating mode and speed setpoint are maintained via the notify characteristic so if changed by the front-panel or App, the buttons will cycle from that updated mode.

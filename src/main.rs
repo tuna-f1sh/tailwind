@@ -18,12 +18,13 @@ use nrf_softdevice::{raw, Softdevice};
 use core::cell::RefCell;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::signal::Signal;
+use embassy_sync::channel::Channel;
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use futures::pin_mut;
 
 #[cfg(feature = "fixed_addr")]
 const HEADWIND_ADDR: [u8; 6] = [0xb9, 0xb1, 0x4f, 0x9d, 0x10, 0xe3];
-const SPEED_STEP: u8 = 25;
+const SPEED_STEP: u8 = 20;
 
 #[derive(Debug, defmt::Format)]
 #[allow(dead_code)]
@@ -73,7 +74,7 @@ impl From<HeadwindState> for u8 {
 impl HeadwindState {
     fn next(self) -> Self {
         match self {
-            // off -> hr -> manual(speed step,100,step) -> hr ...
+            // off -> hr -> manual(speed step,100,step) -> off ...
             HeadwindState::Off => HeadwindState::HeartRate,
             HeadwindState::Speed |
                 HeadwindState::HeartRate |
@@ -83,7 +84,7 @@ impl HeadwindState {
                 if speed < 100 {
                     HeadwindState::Manual(speed + (SPEED_STEP - speed % SPEED_STEP))
                 } else {
-                    HeadwindState::HeartRate
+                    HeadwindState::Off
                 }
             }
         }
@@ -94,12 +95,12 @@ impl HeadwindState {
             // off <- hr <- manual(speed, 100,step,-step) <- off ...
             HeadwindState::Off |
                 HeadwindState::Sleep |
-                HeadwindState::HeartRate |
+                // HeadwindState::HeartRate |
                 HeadwindState::Manual(0xFF)  => HeadwindState::Manual(100),
-            // HeadwindState::HeartRate => HeadwindState::Off,
+            HeadwindState::HeartRate => HeadwindState::Off,
             HeadwindState::Speed => HeadwindState::HeartRate,
             HeadwindState::Manual(speed) => {
-                if speed < SPEED_STEP {
+                if speed <= SPEED_STEP {
                     HeadwindState::HeartRate
                 } else {
                     HeadwindState::Manual(speed - SPEED_STEP)
@@ -257,34 +258,33 @@ impl Headwind {
     fn update_led(&self) -> () {
         match self.state.lock(|state| *state.borrow()) {
             HeadwindState::HeartRate => {
-                LED_SIGNAL.signal(LedRequest::Mask(
-                        MaskedRequest { 
-                            rgb_mask: (true, false, false),
-                            state: Led::On,
+                LED_CHANNEL.try_send(LedRequest::Set(
+                        SetRequest { 
+                            // Red
+                            rgb_state: (Some(Led::On), Some(Led::Off), None),
                             stop_blink: false
                         }
                     )
-                );
+                ).map_err(|e| error!("Failed to send LED request: {:?}", e)).ok();
             },
             HeadwindState::Manual(_) => {
-                LED_SIGNAL.signal(LedRequest::Mask(
-                        MaskedRequest { 
-                            rgb_mask: (false, true, false),
-                            state: Led::On,
+                LED_CHANNEL.try_send(LedRequest::Set(
+                        SetRequest { 
+                            // Green
+                            rgb_state: (Some(Led::Off), Some(Led::On), None),
                             stop_blink: false
                         }
                     )
-                );
+                ).map_err(|e| error!("Failed to send LED request: {:?}", e)).ok();
             },
             _ => {
-                LED_SIGNAL.signal(LedRequest::Mask(
-                        MaskedRequest { 
-                            rgb_mask: (true, true, false),
-                            state: Led::Off,
+                LED_CHANNEL.try_send(LedRequest::Set(
+                        SetRequest { 
+                            rgb_state: (Some(Led::Off), Some(Led::Off), None),
                             stop_blink: false
                         }
                     )
-                );
+                ).map_err(|e| error!("Failed to send LED request: {:?}", e)).ok();
             },
         }
     }
@@ -483,6 +483,11 @@ fn init_peripherals() -> Peripherals {
 }
 
 async fn button_task<'a>(up_btn: &'a mut Input<'_, AnyPin>, down_btn: &'a mut Input<'_, AnyPin>, headwind: &'a Headwind) {
+    // Waits for falling edge on either button and then issues next/previous
+    // state Since we await on both futures, we'll only get one button press at
+    // a time. The await for the ACK in the event handler also ensures that we
+    // don't get multiple button presses before acting; however, it does mean
+    // that the button press is not responsive until the ACK is received/1000 ms timeout.
     loop {
         let up_fut = async { up_btn.wait_for_falling_edge().await };
         let down_fut = async { down_btn.wait_for_falling_edge().await };
@@ -491,33 +496,30 @@ async fn button_task<'a>(up_btn: &'a mut Input<'_, AnyPin>, down_btn: &'a mut In
         match futures::future::select(up_fut, down_fut).await {
             futures::future::Either::Left(_) => {
                 debug!("Up pressed");
-                LED_SIGNAL.signal(LedRequest::Blink(
+                LED_CHANNEL.try_send(LedRequest::Blink(
                         BlinkRequest { 
-                            rgb_mask: (false, true, false),
-                            state_state: Led::Off, 
+                            rgb_state: (Some(Led::On), Some(Led::On), None),
                             on_period: 100, 
                             off_period: 100,
-                            repeat: false
+                            repeat: 1
                         }
                     )
-                );
-                // LED_SIGNAL.signal(LedRequest::Blink(false, true, false, 100, None));
+                ).map_err(|e| error!("Failed to send LED request: {:?}", e)).ok();
                 if let Err(e) = headwind.next_state().await {
                     error!("Failed to set next state: {:?}", e);
                 }
             }
             futures::future::Either::Right(_) => {
                 debug!("Down pressed");
-                LED_SIGNAL.signal(LedRequest::Blink(
+                LED_CHANNEL.try_send(LedRequest::Blink(
                         BlinkRequest { 
-                            rgb_mask: (false, true, false),
-                            state_state: Led::Off, 
+                            rgb_state: (Some(Led::On), Some(Led::On), None),
                             on_period: 100, 
                             off_period: 100,
-                            repeat: false
+                            repeat: 1
                         }
                     )
-                );
+                ).map_err(|e| error!("Failed to send LED request: {:?}", e)).ok();
                 if let Err(e) = headwind.previous_state().await {
                     error!("Failed to set previous state: {:?}", e);
                 }
@@ -535,51 +537,62 @@ enum Led {
 
 #[derive(Debug, Copy, Clone, defmt::Format)]
 struct BlinkRequest {
-    /// Which LEDs to include in blink
-    rgb_mask: (bool, bool, bool),
-    /// State to start blink
-    ///
-    /// Inverse will be final state (if not repeat)
-    state_state: Led,
+    /// Which LEDs to include in blink and starting state
+    rgb_state: (Option<Led>, Option<Led>, Option<Led>),
     /// On period in ms
     on_period: u64,
     /// Off period in ms
     off_period: u64,
-    /// Repeat blink
-    repeat: bool,
+    /// Repeat blink count -1 for infinite
+    repeat: i8,
+}
+
+impl BlinkRequest {
+    fn set_leds(&self, rled: &mut Output<'_, AnyPin>, gled: &mut Output<'_, AnyPin>, bled: &mut Output<'_, AnyPin>) -> () {
+        if let Some(state) = self.rgb_state.0 { rled.set_level(Level::from(state)); }
+        if let Some(state) = self.rgb_state.1 { gled.set_level(Level::from(state)); }
+        if let Some(state) = self.rgb_state.2 { bled.set_level(Level::from(state)); }
+    }
+
+    fn run(&mut self, rled: &mut Output<'_, AnyPin>, gled: &mut Output<'_, AnyPin>, bled: &mut Output<'_, AnyPin>) -> () {
+        self.set_leds(rled, gled, bled);
+        // Toggle level for next
+        self.rgb_state.0 = self.rgb_state.0.map(|mut state| { state.toggle(); state });
+        self.rgb_state.1 = self.rgb_state.1.map(|mut state| { state.toggle(); state });
+        self.rgb_state.2 = self.rgb_state.2.map(|mut state| { state.toggle(); state });
+        // Decrement repeat
+        if self.repeat > 0 { self.repeat -= 1; }
+    }
 }
 
 #[derive(Debug, Copy, Clone, defmt::Format)]
-struct MaskedRequest {
-    /// Which LEDs to include in request
-    rgb_mask: (bool, bool, bool),
-    /// State to set
-    state: Led,
+struct SetRequest {
+    /// State to set Option allows for masking out LEDs to leave in current
+    rgb_state: (Option<Led>, Option<Led>, Option<Led>),
     /// Stop blink if currently blinking
     stop_blink: bool,
 }
 
-#[derive(Debug, Copy, Clone, defmt::Format)]
-struct StateRequest {
-    /// State of each LED
-    state: (Led, Led, Led),
-    /// Stop blink if currently blinking
-    stop_blink: bool,
+impl SetRequest {
+    fn set_leds(&self, rled: &mut Output<'_, AnyPin>, gled: &mut Output<'_, AnyPin>, bled: &mut Output<'_, AnyPin>) -> () {
+        if let Some(state) = self.rgb_state.0 { rled.set_level(Level::from(state)); }
+        if let Some(state) = self.rgb_state.1 { gled.set_level(Level::from(state)); }
+        if let Some(state) = self.rgb_state.2 { bled.set_level(Level::from(state)); }
+    }
 }
 
 #[derive(Debug, Copy, Clone, defmt::Format)]
 #[allow(dead_code)]
 enum LedRequest {
     Blink(BlinkRequest),
-    Mask(MaskedRequest),
-    Set(StateRequest),
+    Set(SetRequest),
 }
 
 impl From<Led> for Level {
     fn from(level: Led) -> Self {
         match level {
-            Led::On => Level::High,
-            Led::Off => Level::Low,
+            Led::On => Level::Low,
+            Led::Off => Level::High,
         }
     }
 }
@@ -587,8 +600,8 @@ impl From<Led> for Level {
 impl From<Level> for Led {
     fn from(level: Level) -> Self {
         match level {
-            Level::Low => Led::Off,
-            Level::High => Led::On,
+            Level::Low => Led::On,
+            Level::High => Led::Off,
         }
     }
 }
@@ -602,7 +615,7 @@ impl Led {
     }
 }
 
-static LED_SIGNAL: Signal<ThreadModeRawMutex, LedRequest> = Signal::new();
+static LED_CHANNEL: Channel<ThreadModeRawMutex, LedRequest, 8> = Channel::new();
 
 #[embassy_executor::task]
 async fn led_task(rpin: AnyPin, gpin: AnyPin, bpin: AnyPin) {
@@ -611,6 +624,7 @@ async fn led_task(rpin: AnyPin, gpin: AnyPin, bpin: AnyPin) {
     // * blinking multiple LEDs at once
     // * return to pre-blinking state
     // * futures could be used of LedReqest to LED_SIGNAL (as Channel) to allow for more complex LED patterns
+    // TODO: make PWM for brightness control and blink period for each LED
     let rled = Output::new(rpin, Level::High, OutputDrive::Standard);
     let gled = Output::new(gpin, Level::High, OutputDrive::Standard);
     let bled = Output::new(bpin, Level::High, OutputDrive::Standard);
@@ -619,110 +633,77 @@ async fn led_task(rpin: AnyPin, gpin: AnyPin, bpin: AnyPin) {
     // Keeps track of current blink timeout
     let mut blink_timeout: Option<embassy_time::Duration> = None;
     // Keeps track of current LED request
-    let mut request: LedRequest = LedRequest::Mask(MaskedRequest { rgb_mask: (true, true, true), state: Led::Off, stop_blink: false });
+    let mut request: LedRequest = LedRequest::Set(SetRequest { rgb_state: (Some(Led::Off), Some(Led::Off), Some(Led::Off)), stop_blink: false });
     // Keeps track of last SetRequest so that blink can return to it
-    let mut last_set = MaskedRequest { rgb_mask: (true, true, true), state: Led::Off, stop_blink: false };
+    let mut last_set = SetRequest { rgb_state: (Some(Led::Off), Some(Led::Off), Some(Led::Off)), stop_blink: false };
     // Keeps track of when blink timeout was set so that LED_SIGNAL select does not cause blink glitch
     let mut timeout_set = embassy_time::Instant::now();
 
     loop {
         if let Some(period) = blink_timeout {
-            match futures::future::select(LED_SIGNAL.wait(), embassy_time::Timer::at(timeout_set + period)).await {
+            match futures::future::select(LED_CHANNEL.receive(), embassy_time::Timer::at(timeout_set + period)).await {
                 futures::future::Either::Left((val, _)) => {
-                    debug!("LED_SIGNAL: {:?}", val);
+                    debug!("LED acting on {:?}", request);
                     match val {
                         LedRequest::Blink(mut blink_req) => {
-                            if blink_req.rgb_mask.0 { rled.set_level(Level::from(blink_req.state_state)); }
-                            if blink_req.rgb_mask.1 { gled.set_level(Level::from(blink_req.state_state)); }
-                            if blink_req.rgb_mask.2 { bled.set_level(Level::from(blink_req.state_state)); }
-                            // Toggle level for next
-                            blink_req.state_state.toggle();
+                            blink_req.run(&mut rled, &mut gled, &mut bled);
 
                             request = LedRequest::Blink(blink_req);
                             blink_timeout = Some(embassy_time::Duration::from_millis(blink_req.on_period));
                             timeout_set = embassy_time::Instant::now();
                         },
-                        LedRequest::Mask(set_req) => {
-                            if set_req.rgb_mask.0 { rled.set_level(Level::from(set_req.state)); }
-                            if set_req.rgb_mask.1 { gled.set_level(Level::from(set_req.state)); }
-                            if set_req.rgb_mask.2 { bled.set_level(Level::from(set_req.state)); }
+                        LedRequest::Set(set_req) => {
+                            set_req.set_leds(&mut rled, &mut gled, &mut bled);
                             if set_req.stop_blink {
                                 blink_timeout = None;
                             }
                             last_set = set_req;
                         },
-                        LedRequest::Set(state_req) => {
-                            rled.set_level(Level::from(state_req.state.0));
-                            gled.set_level(Level::from(state_req.state.1));
-                            bled.set_level(Level::from(state_req.state.2));
-                            if state_req.stop_blink {
-                                blink_timeout = None;
-                            }
-                        }
                     }
                 },
                 // Blink timeout
                 futures::future::Either::Right(_) => {
+                    trace!("Blink timeout acting on {:?}", request);
                     match request {
                         LedRequest::Blink(mut blink_req) => {
-                            if blink_req.rgb_mask.0 { rled.set_level(Level::from(blink_req.state_state)); }
-                            if blink_req.rgb_mask.1 { gled.set_level(Level::from(blink_req.state_state)); }
-                            if blink_req.rgb_mask.2 { bled.set_level(Level::from(blink_req.state_state)); }
+                            blink_req.run(&mut rled, &mut gled, &mut bled);
 
-                            // Toggle level for next
-                            blink_req.state_state.toggle();
-
-                            // Repeat blink
-                            if blink_req.repeat {
+                            // Repeat blink if -1 or more repeats
+                            if blink_req.repeat != 0 {
                                 request = LedRequest::Blink(blink_req);
                             } else {
-                                request = LedRequest::Mask(last_set);
+                                last_set.stop_blink = true;
+                                request = LedRequest::Set(last_set);
                             }
                             blink_timeout = Some(embassy_time::Duration::from_millis(blink_req.off_period));
                             timeout_set = embassy_time::Instant::now();
                         },
-                        LedRequest::Mask(set_req) => {
-                            if set_req.rgb_mask.0 { rled.set_level(Level::from(set_req.state)); }
-                            if set_req.rgb_mask.1 { gled.set_level(Level::from(set_req.state)); }
-                            if set_req.rgb_mask.2 { bled.set_level(Level::from(set_req.state)); }
+                        LedRequest::Set(set_req) => {
+                            set_req.set_leds(&mut rled, &mut gled, &mut bled);
                             if set_req.stop_blink {
                                 blink_timeout = None;
                             }
                         },
-                        _ => ()
                     }
                 }
             };
         } else {
-            match LED_SIGNAL.wait().await {
+            let val = LED_CHANNEL.receive().await;
+            debug!("LED acting on {:?}", val);
+            match val {
                 LedRequest::Blink(mut blink_req) => {
-                    if blink_req.rgb_mask.0 { rled.set_level(Level::from(blink_req.state_state)); }
-                    if blink_req.rgb_mask.1 { gled.set_level(Level::from(blink_req.state_state)); }
-                    if blink_req.rgb_mask.2 { bled.set_level(Level::from(blink_req.state_state)); }
-                    // Toggle level for next
-                    blink_req.state_state.toggle();
-
+                    blink_req.run(&mut rled, &mut gled, &mut bled);
                     request = LedRequest::Blink(blink_req);
                     blink_timeout = Some(embassy_time::Duration::from_millis(blink_req.on_period));
                     timeout_set = embassy_time::Instant::now();
                 },
-                LedRequest::Mask(set_req) => {
-                    if set_req.rgb_mask.0 { rled.set_level(Level::from(set_req.state)); }
-                    if set_req.rgb_mask.1 { gled.set_level(Level::from(set_req.state)); }
-                    if set_req.rgb_mask.2 { bled.set_level(Level::from(set_req.state)); }
+                LedRequest::Set(set_req) => {
+                    set_req.set_leds(&mut rled, &mut gled, &mut bled);
                     if set_req.stop_blink {
                         blink_timeout = None;
                     }
                     last_set = set_req;
                 },
-                LedRequest::Set(state_req) => {
-                    rled.set_level(Level::from(state_req.state.0));
-                    gled.set_level(Level::from(state_req.state.1));
-                    bled.set_level(Level::from(state_req.state.2));
-                    if state_req.stop_blink {
-                        blink_timeout = None;
-                    }
-                }
             }
         }
     }
@@ -749,7 +730,6 @@ async fn main(spawner: Spawner) {
             conn_count: 6,
             event_length: 6,
         }),
-        conn_gatt: Some(raw::ble_gatt_conn_cfg_t { att_mtu: 23 }),
         gatts_attr_tab_size: Some(raw::ble_gatts_cfg_attr_tab_size_t { attr_tab_size: 32768 }),
         gap_role_count: Some(raw::ble_gap_cfg_role_count_t {
             adv_set_count: 0, // don't need advertising
@@ -771,16 +751,15 @@ async fn main(spawner: Spawner) {
     unwrap!(spawner.spawn(led_task(rpin, gpin, bpin)));
 
     // Blink Blue LED while connecting
-    LED_SIGNAL.signal(LedRequest::Blink(
+    LED_CHANNEL.send(LedRequest::Blink(
             BlinkRequest { 
-                rgb_mask: (false, false, true),
-                state_state: Led::Off, 
+                rgb_state: (Option::None, Option::None, Some(Led::On)),
                 on_period: 400, 
                 off_period: 400,
-                repeat: true
+                repeat: -1
             }
         )
-    );
+    ).await;
 
     loop {
         match find_headwind(sd).await {
@@ -788,8 +767,8 @@ async fn main(spawner: Spawner) {
                 // Enable command notifications from the peripheral
                 headwind.client.command_cccd_write(true).await.unwrap();
 
-                // Clear blink
-                LED_SIGNAL.signal(LedRequest::Mask(MaskedRequest { rgb_mask: (false, false, true), state: Led::Off, stop_blink: true }));
+                // Clear blink set constant blue for connected
+                LED_CHANNEL.send(LedRequest::Set(SetRequest { rgb_state: (Some(Led::Off), Some(Led::Off), Some(Led::On)), stop_blink: true })).await;
 
                 // Start button future
                 let button_fut = button_task(&mut up_btn, &mut down_btn, &headwind);
@@ -829,16 +808,15 @@ async fn main(spawner: Spawner) {
                 };
 
                 // Back to blinking blue
-                LED_SIGNAL.signal(LedRequest::Blink(
+                LED_CHANNEL.send(LedRequest::Blink(
                         BlinkRequest { 
-                            rgb_mask: (false, false, true),
-                            state_state: Led::Off, 
+                            rgb_state: (Option::None, Option::None, Some(Led::On)),
                             on_period: 400, 
                             off_period: 400,
-                            repeat: true
+                            repeat: -1
                         }
                     )
-                );
+                ).await;
 
                 // Disconnected
                 // Since we're in a loop, we'll just try to reconnect
