@@ -25,6 +25,7 @@ static_cell = "1.0.0"
 
 [features]
 fixed_addr = [] # Used HEADWIND_ADDR rather than scanning for device with name HEADWIND..
+feather_neokey = [] # Use Feather pinout with neokey
 
 # copied from examples...
 [patch.crates-io]

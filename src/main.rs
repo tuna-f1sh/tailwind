@@ -715,9 +715,19 @@ async fn main(spawner: Spawner) {
 
     // Initialize peripherals; GPIOs and SoftDevice
     let p = init_peripherals();
-    // nrf52540dk buttons - also p0.24 and p0.25
-    let mut down_btn = Input::new(p.P0_11.degrade(), Pull::Up); // 11 on Feather/Button 1 on DK
-    let mut up_btn = Input::new(p.P0_12.degrade(), Pull::Up); // SCK on Feather/Button 2 on DK
+
+    let (mut down_btn, mut up_btn) = if cfg!(feature = "feather_neokey") {
+        info!("Running on Feather NeoKey");
+        let down_btn = Input::new(p.P1_08.degrade(), Pull::Up); // D5
+        let up_btn = Input::new(p.P0_07.degrade(), Pull::Up); // D6
+        (down_btn, up_btn)
+    } else {
+        info!("Running on nRF52 DK");
+        // nrf52540dk buttons - also p0.24 and p0.25
+        let down_btn = Input::new(p.P0_11.degrade(), Pull::Up); // SCL on Feather/Button 1 on DK
+        let up_btn = Input::new(p.P0_12.degrade(), Pull::Up); // SDA on Feather/Button 2 on DK
+        (down_btn, up_btn)
+    };
 
     let config = nrf_softdevice::Config {
         clock: Some(raw::nrf_clock_lf_cfg_t {
@@ -746,8 +756,8 @@ async fn main(spawner: Spawner) {
 
     // LED task
     let rpin = p.P0_13.degrade(); // MOSI on Feather/LED1 on DK
-    let gpin = p.P0_14.degrade(); // MISO on Feather/LED2 on DK
-    let bpin = p.P0_15.degrade(); // 15 on Feather/LED3 on DK
+    let gpin = p.P0_14.degrade(); // SCK on Feather/LED2 on DK
+    let bpin = p.P0_15.degrade(); // MISO on Feather/LED3 on DK
     unwrap!(spawner.spawn(led_task(rpin, gpin, bpin)));
 
     // Blink Blue LED while connecting
