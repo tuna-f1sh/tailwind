@@ -2,6 +2,8 @@ BLE remote for [Wahoo Headwind](https://eu.wahoofitness.com/devices/indoor-cycli
 
 Cycles modes, speed setpoint in sync with front-panel/App control.
 
+https://github.com/tuna-f1sh/tailwind/assets/1886746/1fe502b9-5f74-41d0-b3a3-664f1ef39549
+
 ## Requires
 
 * nRF52840 board (using nRF52840dk) or Feather nRF52840 (will require JLink); can be ported to other nrf5XXXX but these are my targets.
