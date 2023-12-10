@@ -1,6 +1,6 @@
 BLE remote for [Wahoo Headwind](https://eu.wahoofitness.com/devices/indoor-cycling/accessories/kickr-headwind) using [embassy-rs/nrf-softdevice](https://github.com/embassy-rs/nrf-softdevice).
 
-Cycles modes, speed setpoint in sync with front-panel/App control.
+Cycles modes and speed setpoint in sync with front-panel/App control. The system works from my reverse engineering the simple BLE protocol with WireShark. It's not perfect; the protocol state notify is cyclic rather than actual notify so can represent an old state rather than expected setpoint. The remote handles this well enough for this task though.
 
 https://github.com/tuna-f1sh/tailwind/assets/1886746/1fe502b9-5f74-41d0-b3a3-664f1ef39549
 
