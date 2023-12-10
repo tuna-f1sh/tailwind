@@ -4,7 +4,8 @@ Cycles modes, speed setpoint in sync with front-panel/App control.
 
 ## Requires
 
-* nRF52840 board (using nRF52840dk); can be ported to other nrf5XXXX but this is my target.
+* nRF52840 board (using nRF52840dk) or Feather nRF52840 (will require JLink); can be ported to other nrf5XXXX but these are my targets.
+* NeoKey Wing for final assembly and [case](https://learn.adafruit.com/deco-two-key-keypad-macropad-circuitpython-feather/build-the-deco-keypad): `--features=feather_neokey`.
 * `cargo install probe-rs -F=cli`
 
 ## Setup
